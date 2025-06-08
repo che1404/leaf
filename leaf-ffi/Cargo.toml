@@ -32,5 +32,10 @@ outbound-quic = [
 
 auto-reload = ["leaf/auto-reload"]
 
+# Features necesarias para SafeLink
+inbound-tun = ["leaf/inbound-tun"]
+outbound-direct = ["leaf/outbound-direct"]
+outbound-drop = ["leaf/outbound-drop"]
+
 [dependencies]
-leaf = { path = "../leaf", default-features = false, optional = true }
+leaf = { path = "../leaf", default-features = false }
