@@ -612,3 +612,17 @@ Direct = direct
         }
     }
 }
+
+// Domain filtering support for leaf-ffi integration
+#[derive(Debug, Clone, Copy)]
+pub enum DomainFilterResult {
+    Allow = 0,
+    Deny = 1,
+}
+
+// Async wrapper for the domain filter check
+pub async fn check_domain_filter(domain: &str) -> DomainFilterResult {
+    // Call the function from leaf-ffi crate
+    // We need to access the global callback system directly
+    crate::app::domain_filter::check_domain_filter_impl(domain).await
+}

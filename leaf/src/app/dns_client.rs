@@ -414,6 +414,18 @@ impl DnsClient {
             return Ok(vec![ip]);
         }
 
+        // Check domain filtering hook before proceeding
+        let filter_result = crate::check_domain_filter(host).await;
+        match filter_result {
+            crate::DomainFilterResult::Deny => {
+                debug!("Domain blocked by filter: {}", host);
+                return Err(anyhow!("domain blocked by filter"));
+            }
+            crate::DomainFilterResult::Allow => {
+                trace!("Domain allowed by filter: {}", host);
+            }
+        }
+
         if let Ok(ips) = self.get_cached(host).await {
             return Ok(ips);
         }
