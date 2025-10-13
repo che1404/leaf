@@ -418,8 +418,10 @@ impl DnsClient {
         let filter_result = crate::check_domain_filter(host).await;
         match filter_result {
             crate::DomainFilterResult::Deny => {
-                debug!("Domain blocked by filter: {}", host);
-                return Err(anyhow!("domain blocked by filter"));
+                debug!("Domain blocked by filter: {}, resolving to localhost for immediate connection rejection", host);
+                // Return localhost immediately to prevent resource exhaustion
+                // Client will get instant "connection refused" instead of timeout
+                return Ok(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
             }
             crate::DomainFilterResult::Allow => {
                 trace!("Domain allowed by filter: {}", host);
