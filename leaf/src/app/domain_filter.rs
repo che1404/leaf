@@ -10,8 +10,14 @@ use lazy_static::lazy_static;
 static DOMAIN_FILTER_CALLBACK: Mutex<Option<DomainFilterCallback>> = Mutex::new(None);
 static DOMAIN_FILTER_USER_DATA: Mutex<Option<usize>> = Mutex::new(None);
 
+// Pending request with timestamp for cleanup
+struct PendingRequest {
+    sender: tokio::sync::oneshot::Sender<DomainFilterResult>,
+    created_at: std::time::Instant,
+}
+
 lazy_static! {
-    static ref PENDING_REQUESTS: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<DomainFilterResult>>> = 
+    static ref PENDING_REQUESTS: Mutex<HashMap<u64, PendingRequest>> =
         Mutex::new(HashMap::new());
 }
 static REQUEST_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -42,8 +48,8 @@ pub fn register_callback(
 /// Resolve a domain filtering request (called from leaf-ffi)
 pub fn resolve_request(request_id: u64, result: DomainFilterResult) -> bool {
     let mut pending = PENDING_REQUESTS.lock().unwrap();
-    if let Some(sender) = pending.remove(&request_id) {
-        let _ = sender.send(result);
+    if let Some(pending_req) = pending.remove(&request_id) {
+        let _ = pending_req.sender.send(result);
         true
     } else {
         false
@@ -51,38 +57,66 @@ pub fn resolve_request(request_id: u64, result: DomainFilterResult) -> bool {
 }
 
 /// Implementation of domain filtering check
+///
+/// IMPORTANT: The domain string pointer passed to the callback is EPHEMERAL.
+/// It is ONLY valid during the callback execution. The callback implementation
+/// MUST copy the string immediately (e.g., using Swift's String(cString:)).
 pub async fn check_domain_filter_impl(domain: &str) -> DomainFilterResult {
     // Check if callback is registered
     let callback = {
         let cb = DOMAIN_FILTER_CALLBACK.lock().unwrap();
         *cb
     };
-    
+
     let user_data = {
         let data = DOMAIN_FILTER_USER_DATA.lock().unwrap();
         *data
     };
-    
+
     if let Some(callback) = callback {
-        // Generate unique request ID
-        let request_id = REQUEST_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Wrap request IDs to prevent overflow and reuse old IDs
+        // 1 million is enough to avoid collisions given the 5-second timeout
+        let request_id = REQUEST_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 1_000_000;
         
         // Create oneshot channel for response
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        
-        // Store the sender
+
+        // Store the sender with timestamp
         {
             let mut pending = PENDING_REQUESTS.lock().unwrap();
-            pending.insert(request_id, sender);
+
+            // Periodic cleanup every 100 requests to prevent buildup
+            if request_id % 100 == 0 {
+                let now = std::time::Instant::now();
+                let initial_count = pending.len();
+                pending.retain(|_, req| {
+                    now.duration_since(req.created_at) < std::time::Duration::from_secs(10)
+                });
+                let cleaned = initial_count - pending.len();
+                if cleaned > 0 {
+                    debug!("Auto-cleaned {} stale requests", cleaned);
+                }
+            }
+
+            pending.insert(request_id, PendingRequest {
+                sender,
+                created_at: std::time::Instant::now(),
+            });
         }
         
         // Convert domain to C string
         let domain_cstr = std::ffi::CString::new(domain).unwrap();
-        
+
         // Call the callback
         trace!("Calling domain filter callback for: {}", domain);
         let user_data_ptr = user_data.map(|addr| addr as *mut std::ffi::c_void).unwrap_or(std::ptr::null_mut());
+
+        // IMPORTANT: The domain pointer is EPHEMERAL and ONLY valid during the callback.
+        // The Swift callback MUST copy the string immediately using String(cString:).
+        // The CString will be dropped after this function returns.
         callback(domain_cstr.as_ptr(), request_id, user_data_ptr);
+
+        // CString is automatically dropped here, freeing the memory
         
         // Wait for response with timeout
         match tokio::time::timeout(std::time::Duration::from_secs(5), receiver).await {
@@ -103,4 +137,26 @@ pub async fn check_domain_filter_impl(domain: &str) -> DomainFilterResult {
         trace!("No domain filter callback registered, allowing: {}", domain);
         DomainFilterResult::Allow
     }
+}
+
+/// Cleanup stale domain filter requests older than the specified duration.
+/// Returns the number of cleaned requests.
+///
+/// This should be called periodically to prevent memory leaks from requests
+/// that never receive a response.
+pub fn cleanup_stale_requests(max_age: std::time::Duration) -> usize {
+    let mut pending = PENDING_REQUESTS.lock().unwrap();
+    let now = std::time::Instant::now();
+    let initial_count = pending.len();
+
+    pending.retain(|_id, req| {
+        let age = now.duration_since(req.created_at);
+        age < max_age
+    });
+
+    let cleaned = initial_count - pending.len();
+    if cleaned > 0 {
+        debug!("Cleaned {} stale domain filter requests (age > {:?})", cleaned, max_age);
+    }
+    cleaned
 }

@@ -32,9 +32,15 @@ static DOMAIN_FILTER_CALLBACK: Mutex<Option<DomainFilterCallback>> = Mutex::new(
 // Use usize instead of raw pointer to work around Send requirement
 static DOMAIN_FILTER_USER_DATA: Mutex<Option<usize>> = Mutex::new(None);
 
+// Pending request with timestamp for cleanup
+struct PendingRequest {
+    sender: tokio::sync::oneshot::Sender<DomainFilterResult>,
+    created_at: std::time::Instant,
+}
+
 /// Pending domain filter requests
 lazy_static::lazy_static! {
-    static ref PENDING_REQUESTS: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<DomainFilterResult>>> = 
+    static ref PENDING_REQUESTS: Mutex<HashMap<u64, PendingRequest>> =
         Mutex::new(HashMap::new());
 }
 
@@ -250,8 +256,8 @@ pub extern "C" fn leaf_resolve_domain_filter(
     // Try to resolve in both locations
     let resolved_in_ffi = {
         let mut pending = PENDING_REQUESTS.lock().unwrap();
-        if let Some(sender) = pending.remove(&request_id) {
-            let _ = sender.send(result);
+        if let Some(pending_req) = pending.remove(&request_id) {
+            let _ = pending_req.sender.send(result);
             true
         } else {
             false
@@ -265,6 +271,21 @@ pub extern "C" fn leaf_resolve_domain_filter(
     } else {
         ERR_IO // Request not found
     }
+}
+
+/// Cleanup stale domain filter requests.
+fn cleanup_stale_requests_ffi(max_age: std::time::Duration) -> usize {
+    let mut pending = PENDING_REQUESTS.lock().unwrap();
+    let now = std::time::Instant::now();
+    let initial_count = pending.len();
+
+    pending.retain(|_id, req| {
+        let age = now.duration_since(req.created_at);
+        age < max_age
+    });
+
+    let cleaned = initial_count - pending.len();
+    cleaned
 }
 
 /// Checks if a domain should be allowed or denied.
@@ -285,22 +306,36 @@ pub async fn check_domain_filter(domain: &str) -> DomainFilterResult {
     };
     
     if let Some(callback) = callback {
-        // Generate unique request ID
-        let request_id = REQUEST_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        
+        // Generate unique request ID with wrapping to prevent overflow
+        let request_id = REQUEST_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 1_000_000;
+
         // Create oneshot channel for response
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        
-        // Store the sender
+
+        // Store the sender with timestamp
         {
             let mut pending = PENDING_REQUESTS.lock().unwrap();
-            pending.insert(request_id, sender);
+
+            // Periodic cleanup every 100 requests
+            if request_id % 100 == 0 {
+                let now = std::time::Instant::now();
+                let initial_count = pending.len();
+                pending.retain(|_, req| {
+                    now.duration_since(req.created_at) < std::time::Duration::from_secs(10)
+                });
+            }
+
+            pending.insert(request_id, PendingRequest {
+                sender,
+                created_at: std::time::Instant::now(),
+            });
         }
         
         // Convert domain to C string
         let domain_cstr = std::ffi::CString::new(domain).unwrap();
-        
-        // Call the callback
+
+        // IMPORTANT: The domain pointer is EPHEMERAL and ONLY valid during the callback.
+        // The Swift callback MUST copy the string immediately using String(cString:).
         let user_data_ptr = user_data.map(|addr| addr as *mut std::ffi::c_void).unwrap_or(std::ptr::null_mut());
         callback(domain_cstr.as_ptr(), request_id, user_data_ptr);
         
