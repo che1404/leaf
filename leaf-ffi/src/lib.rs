@@ -354,3 +354,59 @@ pub async fn check_domain_filter(domain: &str) -> DomainFilterResult {
         DomainFilterResult::Allow
     }
 }
+
+/// Manual cleanup of stale domain filter requests.
+///
+/// This function removes domain filter requests that are older than the specified age.
+/// Useful when Swift detects high memory pressure and wants to proactively free memory.
+///
+/// @param max_age_secs Maximum age in seconds. Requests older than this will be removed.
+/// @return Number of requests that were cleaned up.
+#[no_mangle]
+pub extern "C" fn leaf_cleanup_domain_filter_memory(max_age_secs: u64) -> u64 {
+    let max_age = std::time::Duration::from_secs(max_age_secs);
+
+    // Cleanup in both locations (lib.rs and domain_filter.rs)
+    let cleaned_ffi = cleanup_stale_requests_ffi(max_age);
+    let cleaned_leaf = leaf::app::domain_filter::cleanup_stale_requests(max_age);
+
+    let total_cleaned = cleaned_ffi + cleaned_leaf;
+
+    if total_cleaned > 0 {
+        eprintln!("leaf_cleanup_domain_filter_memory: cleaned {} requests (ffi: {}, leaf: {})",
+                  total_cleaned, cleaned_ffi, cleaned_leaf);
+    }
+
+    total_cleaned as u64
+}
+
+/// Get memory statistics for the domain filter system.
+///
+/// Provides visibility into pending requests, total requests processed,
+/// and age of the oldest pending request.
+///
+/// @param out_pending_requests Pointer to store the number of pending requests
+/// @param out_total_requests Pointer to store the total number of requests processed
+/// @param out_oldest_age_secs Pointer to store the age of the oldest request in seconds (0 if none)
+/// @return ERR_OK on success
+#[no_mangle]
+pub extern "C" fn leaf_get_domain_filter_stats(
+    out_pending_requests: *mut u64,
+    out_total_requests: *mut u64,
+    out_oldest_age_secs: *mut u64,
+) -> i32 {
+    if out_pending_requests.is_null() || out_total_requests.is_null() || out_oldest_age_secs.is_null() {
+        return ERR_IO; // Invalid parameters
+    }
+
+    // Get stats from the leaf core module
+    let stats = leaf::app::domain_filter::get_memory_stats();
+
+    unsafe {
+        *out_pending_requests = stats.pending_requests as u64;
+        *out_total_requests = stats.total_requests;
+        *out_oldest_age_secs = stats.oldest_request_age_secs.unwrap_or(0);
+    }
+
+    ERR_OK
+}

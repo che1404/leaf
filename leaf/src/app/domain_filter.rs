@@ -142,8 +142,17 @@ pub async fn check_domain_filter_impl(domain: &str) -> DomainFilterResult {
 /// Cleanup stale domain filter requests older than the specified duration.
 /// Returns the number of cleaned requests.
 ///
-/// This should be called periodically to prevent memory leaks from requests
-/// that never receive a response.
+/// This function is safe to call from FFI and can be invoked by Swift
+/// to proactively free memory when high memory pressure is detected.
+///
+/// # Arguments
+/// * `max_age` - Maximum age of requests to keep. Requests older than this will be removed.
+///
+/// # Returns
+/// The number of requests that were cleaned up.
+///
+/// # Thread Safety
+/// This function is thread-safe and can be called from any thread.
 pub fn cleanup_stale_requests(max_age: std::time::Duration) -> usize {
     let mut pending = PENDING_REQUESTS.lock().unwrap();
     let now = std::time::Instant::now();
@@ -159,4 +168,40 @@ pub fn cleanup_stale_requests(max_age: std::time::Duration) -> usize {
         debug!("Cleaned {} stale domain filter requests (age > {:?})", cleaned, max_age);
     }
     cleaned
+}
+
+/// Memory statistics for domain filter system.
+#[derive(Debug, Clone)]
+pub struct DomainFilterMemoryStats {
+    /// Number of pending domain filter requests
+    pub pending_requests: usize,
+    /// Total number of requests processed since startup
+    pub total_requests: u64,
+    /// Age of the oldest pending request in seconds, if any
+    pub oldest_request_age_secs: Option<u64>,
+}
+
+/// Get current memory statistics for the domain filter system.
+///
+/// This function provides visibility into the internal state of the domain
+/// filtering system, useful for monitoring and debugging memory issues.
+///
+/// # Returns
+/// `DomainFilterMemoryStats` containing current statistics.
+///
+/// # Thread Safety
+/// This function is thread-safe and can be called from any thread.
+pub fn get_memory_stats() -> DomainFilterMemoryStats {
+    let pending = PENDING_REQUESTS.lock().unwrap();
+    let now = std::time::Instant::now();
+
+    let oldest_age = pending.values()
+        .map(|req| now.duration_since(req.created_at).as_secs())
+        .max();
+
+    DomainFilterMemoryStats {
+        pending_requests: pending.len(),
+        total_requests: REQUEST_ID_COUNTER.load(std::sync::atomic::Ordering::SeqCst),
+        oldest_request_age_secs: oldest_age,
+    }
 }
