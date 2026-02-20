@@ -5,6 +5,75 @@ use std::{
     collections::HashMap,
 };
 
+// ── Android JNI: protect_socket + JVM lifecycle ────────────────────────────
+//
+// On Android, every socket created by Leaf must be "protected" via
+// VpnService.protect(fd) so that its traffic bypasses the TUN interface.
+// These functions are called from the JNI bridge (leaf_jni_bridge.cpp)
+// in the ClickShield SDK.
+
+#[cfg(target_os = "android")]
+use jni::sys::jint;
+
+/// Called by the JVM when `System.loadLibrary("leaf")` runs on Android.
+/// Caches the JavaVM pointer so that Leaf can attach to the JVM from
+/// any Rust-spawned thread (needed for protect_socket callbacks).
+#[cfg(target_os = "android")]
+#[allow(non_snake_case)]
+#[no_mangle]
+pub unsafe extern "system" fn JNI_OnLoad(
+    vm: jni::JavaVM,
+    _: *mut std::os::raw::c_void,
+) -> jint {
+    leaf::mobile::callback::android::set_jvm(vm);
+    jni::sys::JNI_VERSION_1_6
+}
+
+/// Called by the JVM when `libleaf.so` is about to be unloaded.
+#[cfg(target_os = "android")]
+#[allow(non_snake_case)]
+#[no_mangle]
+pub unsafe extern "system" fn JNI_OnUnload(
+    _vm: jni::JavaVM,
+    _: *mut std::os::raw::c_void,
+) {
+    leaf::mobile::callback::android::unset_protect_socket_callback();
+    leaf::mobile::callback::android::unset_jvm();
+}
+
+/// Registers the VpnService class and method name for socket protection.
+///
+/// Called from `leaf_jni_bridge.cpp` via
+/// `Java_..._LeafEngine_nativeSetProtectSocketCallback`.
+///
+/// @param env   JNI environment.
+/// @param class The VpnService class (or any class that has a `protect(I)Z` method).
+/// @param name  JNI string with the method name (e.g. "protect").
+#[cfg(target_os = "android")]
+#[allow(non_snake_case)]
+#[no_mangle]
+pub unsafe extern "system" fn leaf_set_protect_socket_callback(
+    mut env: jni::JNIEnv,
+    _unused: jni::objects::JClass,
+    class: jni::objects::JClass,
+    name: jni::objects::JString,
+) {
+    let Ok(name_str) = env.get_string(&name) else {
+        return;
+    };
+    let name_string: String = name_str.into();
+    if let Ok(class_g) = env.new_global_ref(class) {
+        leaf::mobile::callback::android::set_protect_socket_callback(class_g, name_string);
+    }
+}
+
+/// Unregisters the protect-socket callback.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn leaf_unset_protect_socket_callback() {
+    leaf::mobile::callback::android::unset_protect_socket_callback();
+}
+
 /// Domain filtering callback type.
 /// 
 /// Parameters:
